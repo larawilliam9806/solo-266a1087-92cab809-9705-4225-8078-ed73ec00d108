@@ -128,6 +128,19 @@ def transitive_reduction(
     return kept
 
 
+def is_reachable(
+    adjacency: dict[Vertex, set[Vertex]], source: Vertex, target: Vertex
+) -> bool:
+    """沿有向边 source 是否能（直接或间接）到达 target。
+
+    用于判定段落结论的先后两个层位能否沿有效记录推出；
+    source 与 target 相同不算可推出（登记时自环已被禁止）。
+    """
+    if source == target:
+        return False
+    return _reachable(adjacency, source, target)
+
+
 def _reachable(
     adjacency: dict[Vertex, set[Vertex]], source: Vertex, target: Vertex
 ) -> bool:

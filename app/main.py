@@ -8,9 +8,13 @@ from fastapi.responses import JSONResponse
 
 from . import service
 from .schemas import (
+    BatchOut,
     BatchRequest,
     BatchResponse,
+    ConclusionRegisterRequest,
+    ConclusionRegisterResponse,
     GroupOut,
+    ReportStatusOut,
     StrataRegisterRequest,
     StrataRegisterResponse,
 )
@@ -89,3 +93,37 @@ def get_group_by_stratum(stratum_no: str) -> GroupOut:
     # 未与任何记录相连的孤立层位 group_id 为 None，仍可正常返回
     result = service.get_group_for_stratum(stratum_no)
     return GroupOut(**result)
+
+
+# ---------- 勘误追踪 ----------
+
+@app.post(
+    "/conclusions",
+    response_model=ConclusionRegisterResponse,
+    status_code=201,
+)
+def register_conclusion(payload: ConclusionRegisterRequest) -> ConclusionRegisterResponse:
+    result = service.register_conclusion(
+        payload.report_no, payload.paragraph_no, payload.before, payload.after
+    )
+    return ConclusionRegisterResponse(**result)
+
+
+@app.get("/reports/{report_no}", response_model=ReportStatusOut)
+def get_report_status(report_no: str) -> ReportStatusOut:
+    return ReportStatusOut(**service.get_report_status(report_no))
+
+
+@app.get("/reports/{report_no}/paragraphs/{paragraph_no}")
+def get_conclusion(report_no: str, paragraph_no: str) -> dict:
+    return service.get_conclusion(report_no, paragraph_no)
+
+
+@app.get("/batches", response_model=list[BatchOut])
+def list_batches() -> list[BatchOut]:
+    return [BatchOut(**b) for b in service.list_batches()]
+
+
+@app.get("/batches/{batch_id}", response_model=BatchOut)
+def get_batch(batch_id: int) -> BatchOut:
+    return BatchOut(**service.get_batch(batch_id))

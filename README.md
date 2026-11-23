@@ -1,13 +1,17 @@
-# 考古层位先后关系图服务
+# 考古层位先后关系图与勘误追踪服务
 
 管理考古现场记录的层位（stratum）先后关系，并输出只保留**无法经其他层位间接推出**
-的连线（有向图传递归约 / transitive reduction）的关系图。
+的连线（有向图传递归约 / transitive reduction）的关系图；同时为报告校对提供
+**勘误追踪**：按报告号、段落号登记已发表结论，自动追踪哪些段落因现场订正而
+失去（或恢复）依据。
 
 - 后端：FastAPI + Uvicorn
 - 存储：SQLite（WAL 模式，标准库 `sqlite3`，零额外 ORM 依赖）
 - 部署：Docker Compose 一键启动，数据库落在具名卷 `/data`
 
 ## 业务规则与设计对应
+
+### 层位关系图
 
 | 需求 | 实现方式 |
 | --- | --- |
@@ -18,22 +22,36 @@
 | 图中只保留不可间接推出的先后线 | DAG 传递归约（`app/graph.py::transitive_reduction`）：逐条边验证"删掉它后两端是否仍可达"，仍可达则省略 |
 | 每条线附全部支持记录号 | `edge_support` 表保存归约边 → 记录号映射 |
 | 间接路径消失后直接线补回 | 每批次都以当前生效记录全集重新归约，撤回/更正使路径消失时，仍有直接记录的边自动回到图中 |
-| 只重算改动前后涉及的层位组 | 受影响顶点 = 批次触碰记录的旧端点 ∪ 新端点；仅拆除并重算这些顶点所在的旧组，其他组数据原样保留（响应 `untouched_groups`） |
+| 只重算改动前后涉及的层位组 | 先在内存模拟本批，按触碰端点在模拟图中的弱连通分量确定涉及层位；仅拆除并重算这些层位所在的旧组，其他组原样保留（响应 `untouched_groups`） |
 | 查询直接读取已生效的图 | 归约结果物化在 `graph_edges` / `edge_support` 表，查询不做临时图计算；WAL 允许写事务进行时并发读 |
 | 本批记录和受影响的图（含拆分/合并后的各组）一并生效 | 单事务 `BEGIN IMMEDIATE` 内完成记录改写、旧组拆除、新组（合并或拆分）写入，一起 commit |
 | 成环返回环上的层位与记录号 | 内存模拟本批后做 DFS 环检测，409 返回 `cycle`（首尾相同的层位序列）与环上每条边的支持记录号（以本批生效时为准） |
 | 成环或保存失败时保留原记录和关系图 | 任何异常都 `ROLLBACK`；成环时记录写入虽先执行，但随回滚全部撤销 |
 
+### 勘误追踪
+
+| 需求 | 实现方式 |
+| --- | --- |
+| 按报告号和段落号登记已发表结论，每段填先后两个层位号 | `POST /conclusions`，`(report_no, paragraph_no)` 唯一；同段不能重复登记 |
+| 登记时须能沿有效记录从前一个层位推到后一个 | 用当前生效记录构 DAG 做可达性检查（`graph.is_reachable`），不可达则 422 拒绝登记，自环同样拒绝 |
+| 每批补录/更正/撤回只复查改动前后涉及层位组内的结论 | 候选结论 = 两个层位都落在本批涉及层位集合内的已登记段落；无关层位组的段落不复查、不产生变化 |
+| 对照整批提交前后状态，记下失去或恢复依据的段落 | 事务内对每个候选结论分别在"提交前记录集"与"提交后记录集"上算可达性，翻转才写 `conclusion_changes`：真→假记 `lost`，假→真记 `restored` |
+| 两次状态相同，即使依据换了也不记 | 仅比较布尔可达状态；依据路径变化但状态不变（如间接路径改直达）时跳过，不写变化 |
+| 每次变化附批次号和本批改动的记录号 | 变化行外键到 `batches`，批次内改动记录号存 `batch_records`，查询时一并带出 |
+| 按报告号查各段当前状态和历次变化 | `GET /reports/{report_no}` 返回各段当前 `supported` 与按时间排序的全部变化；另有单段明细 `GET /reports/{report_no}/paragraphs/{paragraph_no}` |
+| 登记与订正并发按提交顺序处理 | 登记与批次都以 `BEGIN IMMEDIATE` 取同一写锁，SQLite 按拿锁顺序串行；后到事务读到的必是先前已提交状态，已登记段落会被随后生效的相关批次纳入复查 |
+| 现场记录和勘误一并生效，批次失败两者都保持原状 | 记录、批次号、批次记录、结论变化、关系图在同一事务内提交；成环或任何校验失败整体 `ROLLBACK`，失败批次不占用批次号、不留任何痕迹 |
+
 ## 目录结构
 
 ```
 app/
-  graph.py    纯图算法：成环检测、弱连通分量、传递归约
+  graph.py    纯图算法：成环检测、弱连通分量、传递归约、可达性
   db.py       SQLite 连接、WAL/外键配置、建表脚本
   schemas.py  Pydantic 请求/响应模型
-  service.py  事务编排：校验、批次模拟、局部重算、持久化、查询
+  service.py  事务编排：校验、批次模拟、局部重算、勘误比对、持久化、查询
   main.py     FastAPI 路由与异常映射
-tests/        pytest 单元测试 + API 端到端测试（20 个用例）
+tests/        pytest 单元测试 + API 端到端测试（35 个用例）
 Dockerfile
 docker-compose.yml
 ```
@@ -72,10 +90,15 @@ ARCH_DB_PATH=./data/archaeology.db .venv/bin/uvicorn app.main:app --reload
 | --- | --- | --- |
 | POST | `/strata` | 登记层位（重复登记幂等，分别返回 `registered` / `already_existed`） |
 | GET | `/strata` | 列出全部层位及其所属组 |
-| POST | `/records/batch` | 批量补录/更正/撤回，原子生效 |
+| POST | `/records/batch` | 批量补录/更正/撤回，原子生效；响应含 `batch_id` 与本批引发的勘误变化 |
 | GET | `/records?active_only=true` | 列记录（含已撤回，撤回记录 `active=false`） |
 | GET | `/groups` | 全部层位组及其归约图 |
 | GET | `/groups/by-stratum/{stratum_no}` | 按层位号查相连整组（核心查询） |
+| POST | `/conclusions` | 登记报告段落结论（报告号+段落号+先后层位号），须当前可推出 |
+| GET | `/reports/{report_no}` | 按报告号查各段当前状态与历次变化（附批次号、记录号） |
+| GET | `/reports/{report_no}/paragraphs/{paragraph_no}` | 查单段当前状态与该段历次变化 |
+| GET | `/batches` | 全部批次及各批改动的记录号（溯源） |
+| GET | `/batches/{batch_id}` | 单批明细 |
 
 交互式文档：启动后访问 `http://localhost:8000/docs`。
 
@@ -171,12 +194,99 @@ curl -X POST http://localhost:8000/records/batch \
 }
 ```
 
+## 勘误追踪使用示例
+
+### 7. 登记段落结论（须当前可推出）
+
+报告 `RP-7` 第 `P3` 段发表的结论依赖"层位 H1 早于 H3"。H1 可经 H1→H2→H3
+间接推出，登记成功并标记为有依据：
+
+```bash
+curl -X POST http://localhost:8000/conclusions \
+  -H 'Content-Type: application/json' \
+  -d '{"report_no": "RP-7", "paragraph_no": "P3", "before": "H1", "after": "H3"}'
+```
+
+```json
+{"conclusion_id": 1, "report_no": "RP-7", "paragraph_no": "P3",
+ "before": "H1", "after": "H3", "supported": true,
+ "registered_at": "2026-11-23T00:48:05+00:00"}
+```
+
+若当前有效记录无法从 `before` 推出 `after`（含反向、层位未登记、自环），返回 422。
+
+### 8. 现场订正导致段落失去依据
+
+撤回中间记录 `R2`（H2→H3）后，H1→H3 不再可达。批次只复查涉及层位组内的
+段落，P3 由有依据翻转为无依据，记一条 `lost`：
+
+```bash
+curl -X POST http://localhost:8000/records/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"operations": [{"op": "retract", "record_no": "R2"}], "note": "现场订正撤回"}'
+```
+
+响应中的 `conclusion_changes`：
+
+```json
+[{"change_id": 1, "report_no": "RP-7", "paragraph_no": "P3",
+  "change_type": "lost", "supported_before": true, "supported_after": false,
+  "batch_id": 2, "batch_record_numbers": ["R2"],
+  "created_at": "2026-11-23T00:48:14+00:00"}]
+```
+
+> 若只是依据路径改变而"有依据/无依据"状态不变（例如间接路径之外又补了一条
+> 直达记录），`conclusion_changes` 为空——两次状态相同不记。
+
+### 9. 补回记录后依据恢复
+
+重新补录一条 H2→H3 记录，可达性恢复，记一条 `restored`：
+
+```bash
+curl -X POST http://localhost:8000/records/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"operations": [{"op": "add", "record_no": "R4", "before": "H2", "after": "H3"}]}'
+```
+
+### 10. 按报告号查当前状态与历次变化
+
+```bash
+curl http://localhost:8000/reports/RP-7
+```
+
+```json
+{
+  "report_no": "RP-7",
+  "paragraphs": [
+    {"conclusion_id": 1, "report_no": "RP-7", "paragraph_no": "P3",
+     "before": "H1", "after": "H3", "supported": true, "...": "..."}
+  ],
+  "changes": [
+    {"change_id": 1, "paragraph_no": "P3", "change_type": "lost",
+     "supported_before": true, "supported_after": false,
+     "batch_id": 2, "batch_record_numbers": ["R2"], "...": "..."},
+    {"change_id": 2, "paragraph_no": "P3", "change_type": "restored",
+     "supported_before": false, "supported_after": true,
+     "batch_id": 5, "batch_record_numbers": ["R4"], "...": "..."}
+  ]
+}
+```
+
+单段明细：`GET /reports/RP-7/paragraphs/P3`；批次溯源：`GET /batches`、
+`GET /batches/2`。失败（成环/校验不通过）的批次整体回滚，不出现在
+`/batches` 中，也不会让批次号断档。
+
 ## 并发与一致性说明
 
-- 每个批次先在**读阶段**完成前置校验与受影响顶点收集，再用 `BEGIN IMMEDIATE`
+- 每个批次先在事务内完成前置校验与受影响顶点收集，再用 `BEGIN IMMEDIATE`
   取得写锁后做重算；SQLite 单写多读 + WAL 保证：写事务期间，其他连接对
   **已生效图**的查询不受阻塞。
+- 结论登记（`POST /conclusions`）与记录批次共用同一把写锁，因此登记与订正
+  并发时严格按提交（拿锁）顺序串行：后到事务看到的必是先前已提交的状态。
+  若订正先提交并断开了路径，登记会因"缺少依据"被 422 拒绝；若登记先提交，
+  该段落会被随后生效的相关批次纳入复查并留下变化记录。
 - 针对互不相交层位组的两个批次，重算数据互不重叠；写锁仅在最后写入阶段短暂
   持有（`busy_timeout=30s`），其他组的订正可正常排队完成。
-- 批次内所有操作同生共死：任何一步失败或检测到环，事务回滚，库内状态与
-  批次开始前完全一致。
+- 批次内所有操作同生共死：现场记录、批次号、批次记录、勘误变化与关系图在
+  同一事务内提交；任何一步失败或检测到环，事务回滚，库内状态与批次开始前
+  完全一致，失败批次不落账、不占用批次号。
